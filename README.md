@@ -31,28 +31,38 @@ run entirely against mocked API responses — no network calls.
 2. `python3 pms_availability.py`
 3. Open the generated `availability_report.html`.
 
+## Apartment-level report (`apartment_availability_report.py`)
+
+Produces a per-apartment digest — apartment number, apartment name/building,
+current monthly price, available-from date — as branded HTML, pulling
+directly from the confirmed live endpoints (see `CLAUDE.md`). This has been
+run successfully against the live API.
+
+```bash
+python3 apartment_availability_report.py
+# writes apartment_availability_report.html
+```
+
+Takes about a minute — it walks every bookable unit's vacancy calendar and
+every unit type's rate calendar.
+
 ## Status — what's confirmed vs. what's still open
 
-**Confirmed:**
+**Confirmed (including a live run against the real API on 2026-07-08):**
 - PMS: Res:Harmonics, Rerum API v3
 - Base URL: `https://apiv3.rerumapp.uk`
 - Auth: OAuth2 client-credentials grant against `https://auth.rerumapp.uk/oauth2/token`
-  (implemented in `get_access_token()` — standard Cognito-style client-credentials
-  exchange, should work as-is)
+  — confirmed working live, not just in theory.
+- Real endpoints and field names for units, per-unit vacancy, and per-unit-type
+  rates — see the module docstring in `apartment_availability_report.py` and
+  the "Confirmed against the live API" section in `CLAUDE.md`.
 
-**Not yet confirmed — do this next:**
-- The exact availability endpoint path (`AVAILABILITY_ENDPOINT` in
-  `pms_availability.py` is currently a placeholder: `/availability`)
-- The real response field names (`parse_availability_response()` currently
-  guesses `openNightsCount`, `openDateRanges`, `lastSyncedAt`)
-- None of this has been tested against the live API yet — the environment this
-  was built in had outbound network access blocked to `auth.rerumapp.uk` /
-  `apiv3.rerumapp.uk`. First live run will likely 404 on the availability call;
-  the error response should tell you enough to fix the path.
-- Suggested way to confirm: use the "Configuring OAuth2 on Postman" guide at
-  https://apidocs.resharmonics.com/guides/oauth-postman to get a token and
-  explore the API reference at https://apidocs.resharmonics.com/ interactively
-  (it's a JS-rendered site, so it needs a real browser).
+**Still open:**
+- `pms_availability.py`'s partner/property-level model (`AVAILABILITY_ENDPOINT`,
+  `parse_availability_response()`) has NOT been updated to the real API — its
+  granularity (one partner/property → one availability status) doesn't map
+  directly onto the real API's unit/rate/interval model. Needs a product
+  decision on what a "partner" maps to before rewriting it; see `CLAUDE.md`.
 
 See `CLAUDE.md` for full background/context if you're picking this up with
 Claude Code.

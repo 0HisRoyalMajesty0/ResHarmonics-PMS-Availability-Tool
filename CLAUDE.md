@@ -14,49 +14,64 @@ https://app.notion.com/p/392345b06fe68190821cda37a6c58dd7 (Status: In Progress)
 
 ## Current state
 
-- `pms_availability.py` — the full script: OAuth2 auth, availability fetch,
-  classification logic, HTML rendering. Read the module docstring at the top
-  first — it documents exactly what's confirmed vs. still a placeholder.
-- `test_pms_availability.py` — passes, but only tests logic against mocked
-  API responses. Does not touch the real API.
+- `pms_availability.py` — the original partner/property-level digest: OAuth2
+  auth, availability fetch, four-state classification, HTML rendering. The
+  file Cowork produced was actually truncated mid-function (missing HTML
+  closing markup and the entire `main()`/CLI entry point) — fixed on
+  2026-07-08. Its `AVAILABILITY_ENDPOINT`/`parse_availability_response()`
+  guesses (`/availability`, `openNightsCount`, etc.) were never real — see
+  "Confirmed against the live API" below for what the actual endpoints and
+  fields are. This file has NOT been rewritten to use them, since its
+  per-partner/property model doesn't map cleanly onto the real API (which is
+  unit + rate + interval based, not a single "is this property available"
+  call) — if this granularity is still wanted, it needs a product decision on
+  what a "partner/property" maps to (a building? a unit type?) before
+  rewriting `fetch_availability()`/`parse_availability_response()`.
+- `apartment_availability_report.py` — new script, built 2026-07-08, tested
+  live end-to-end against the real API. Produces a per-apartment digest
+  (apartment number, apartment name/building, current monthly price,
+  available-from date) as branded HTML. Read its module docstring for the
+  confirmed endpoints/fields it relies on.
+- `test_pms_availability.py` — passes, but only tests `pms_availability.py`'s
+  classification logic against mocked API responses.
 - `.env.example` — copy to `.env`, fill in credentials from the "Gravity
-  Coliving v3 API" Word doc the user has (Client ID + Client Secret).
+  Coliving v3 API" Word doc.
 
-## What's confirmed
+## Confirmed against the live API (2026-07-08)
 
-- PMS is Res:Harmonics, specifically the Rerum API v3.
-- Base URL: `https://apiv3.rerumapp.uk`
-- Auth URL: `https://auth.rerumapp.uk/oauth2/token`
-- Auth type: OAuth2 client-credentials grant (Cognito-style — HTTP Basic auth
-  with client_id/client_secret, `grant_type=client_credentials`). Implemented
-  in `get_access_token()`. This follows a standard, well-documented pattern,
-  so it's likely correct, but has never actually been run against the live
-  auth server (see below).
+The blocker described in the original handoff (sandbox network access to
+`auth.rerumapp.uk` / `apiv3.rerumapp.uk` blocked) is NOT present in every
+environment — it depended on that session's proxy allowlist. With real
+`RESHARMONICS_CLIENT_ID`/`RESHARMONICS_CLIENT_SECRET` supplied by the user,
+both the OAuth2 exchange and the API calls below were run live and confirmed
+working:
 
-## What's NOT confirmed — this is the immediate next task
-
-1. **The availability endpoint path.** `AVAILABILITY_ENDPOINT = "/availability"`
-   in `pms_availability.py` is a guess, not a confirmed path. The Res:Harmonics
-   API reference (https://apidocs.resharmonics.com/) is a JS-rendered docs
-   site — plain HTTP fetches return an empty shell, so it needs a real browser
-   session to read.
-2. **Response field names.** `parse_availability_response()` guesses
-   `openNightsCount`, `openDateRanges`, `lastSyncedAt` as field names in the
-   JSON response. These are placeholders, not confirmed.
-3. **Nothing has been run against the live API.** The environment this was
-   built in had its outbound network access restricted (an allowlisted proxy
-   blocked `auth.rerumapp.uk` and `apiv3.rerumapp.uk` entirely, HTTP 403
-   `blocked-by-allowlist`). So even the OAuth2 token exchange itself is
-   untested live — only the classification/rendering logic has been verified,
-   via mocks.
-
-**Recommended next step:** use the "Configuring OAuth2 on Postman" guide
-(https://apidocs.resharmonics.com/guides/oauth-postman) to get a token in
-Postman, then browse https://apidocs.resharmonics.com/ to find the real
-availability endpoint and its response shape. Update
-`AVAILABILITY_ENDPOINT` and `parse_availability_response()` accordingly, then
-re-run `test_pms_availability.py` (add a new test using a real captured
-response as a fixture) before pointing it at production partner data.
+- Auth: OAuth2 client-credentials against `https://auth.rerumapp.uk/oauth2/token`
+  works exactly as `get_access_token()` implements it.
+- The real OpenAPI spec is discoverable at `GET /v3/api-docs` on
+  `https://apiv3.rerumapp.uk` (Bearer-authenticated) — this is how the
+  endpoints below were found, since apidocs.resharmonics.com is JS-rendered
+  and wasn't reachable/scrapable even when the network wasn't blocked.
+- `GET /api/v3/units` (paginate with `size=500`) — full unit list:
+  `id`, `unitName` (e.g. `"18 West Court"`), `buildingName`, `bookable`.
+- `GET /api/v3/units/{id}` — per-unit detail incl. `unitType.id`/`unitType.name`.
+- `GET /api/v3/availabilities/unit/{unitId}/intervals?dateFrom=&dateTo=` —
+  ground-truth vacancy per unit: `{startDate, endDate, available}`. This is
+  the right source for "available from."
+- `GET /api/v3/rates?unitTypeId=&dateFrom=&dateTo=` — rate calendar per unit
+  type (not per unit): `rateType` (`MONTHLY`/`DAILY`/`WEEKLY`), `rates: [{date, amount}]`.
+- **Do NOT use `GET /api/v3/availabilities` (the "search" endpoint) as a
+  vacancy check** — it applies real booking-engine rules (lead time, minimum
+  stay, closed-to-arrival) on top of raw vacancy, so querying it with a
+  unit's actual available-from date frequently returns zero results even
+  though the unit is genuinely vacant per `/intervals`. Confirmed this the
+  hard way — cost a lot of back-and-forth before switching to `/intervals`.
+- Portfolio at time of testing: 306 total units, 212 bookable, spanning 10
+  buildings (Gravity Hounslow Central, Gravity Camden Lock, Gravity Camden
+  Town, Gravity Finsbury Park, Gravity Reading Town Centre, Gravity Notting
+  Hill, Gravity West Hampstead, The Weymouth, Gravity Bayswater Hyde Park,
+  plus a `Gravity Test` sandbox building with 1 demo unit — filter that out).
+  All pricing is GBP.
 
 ## Design decisions worth knowing about (don't relitigate without reason)
 
