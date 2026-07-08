@@ -64,6 +64,14 @@ OUTPUT_HTML_PATH = "apartment_availability_report.html"
 
 _BAD_RATE_NAME_RE = re.compile(r"override|sales over ?ride|system", re.I)
 
+# Sanity floor for a MONTHLY rate in GBP. Found during live testing: The
+# Weymouth's "MONTHLY" rate plans (unit types 164/165) carry minStay=2 and
+# amounts of £150-180 — clearly a per-stay/short-let rate mislabelled as
+# MONTHLY in the PMS, not a real month's rent. Anything under this floor is
+# almost certainly the same kind of data error, so it's excluded rather than
+# reported as a apartment's real price.
+MIN_PLAUSIBLE_MONTHLY_GBP = 400.0
+
 _token_cache: dict = {"access_token": None, "expires_at": 0}
 
 
@@ -167,7 +175,7 @@ def best_monthly_rate(rate_entries: list, target_date: dt.date) -> Optional[tupl
         if entry.get("occupancyCount") not in (1, None):
             continue
         for r in entry.get("rates", []):
-            if r.get("amount"):
+            if r.get("amount") and r["amount"] >= MIN_PLAUSIBLE_MONTHLY_GBP:
                 candidates.append((r["date"], r["amount"]))
 
     if not candidates:
@@ -178,7 +186,7 @@ def best_monthly_rate(rate_entries: list, target_date: dt.date) -> Optional[tupl
             if _BAD_RATE_NAME_RE.search(entry.get("name") or ""):
                 continue
             for r in entry.get("rates", []):
-                if r.get("amount"):
+                if r.get("amount") and r["amount"] >= MIN_PLAUSIBLE_MONTHLY_GBP:
                     candidates.append((r["date"], r["amount"]))
 
     if not candidates:
