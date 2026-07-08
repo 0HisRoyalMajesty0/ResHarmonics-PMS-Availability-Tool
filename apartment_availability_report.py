@@ -7,6 +7,15 @@ endpoints were discovered — the OpenAPI spec at /v3/api-docs on the Rerum app
 host, since apidocs.resharmonics.com is JS-rendered and couldn't be scraped
 directly).
 
+AVAILABILITY RULE (business definition, implemented in classify_availability):
+A unit is "available" only if, from the day it becomes vacant, it stays vacant
+for at least VACANT_MONTHS_REQUIRED (2) consecutive calendar months. The report
+is split into two lists:
+  1. Vacant now      — vacant today AND for the next 2 months.
+  2. Becoming vacant — opens up after today but on/before HORIZON_DAYS (92 days)
+                       and then stays vacant for 2 months.
+Vacancies that start beyond HORIZON_DAYS are ignored entirely.
+
 CONFIRMED ENDPOINTS (all under API_BASE_URL, Bearer auth):
   GET /api/v3/units
       -> {"content": [{"id", "unitName", "buildingName", "bookable", ...}], "page": {...}}
@@ -56,9 +65,22 @@ AUTH_URL = os.environ.get("RESHARMONICS_AUTH_URL", "https://auth.rerumapp.uk/oau
 CLIENT_ID = os.environ.get("RESHARMONICS_CLIENT_ID")
 CLIENT_SECRET = os.environ.get("RESHARMONICS_CLIENT_SECRET")
 
-# How far ahead to look for the next vacancy / rate calendar entries.
+# How far ahead to look for the next vacancy / rate calendar entries. Kept
+# generously wide so the 2-month-vacancy check is valid even for a unit that
+# becomes vacant right at the edge of HORIZON_DAYS (its vacancy must be
+# verifiable ~2 months past that).
 LOOKAHEAD_DAYS = 400
 MAX_WORKERS = 8
+
+# Availability definition (per the business rule): a unit only counts as
+# "available" if, from the day it becomes vacant, it stays vacant for at least
+# this many whole calendar months.
+VACANT_MONTHS_REQUIRED = 2
+
+# We only care about vacancies that START within this many days of the run.
+# "Vacant today" units have a start of today (day 0); "becoming vacant" units
+# start after today but on/before this horizon. Anything beyond is ignored.
+HORIZON_DAYS = 92
 
 OUTPUT_HTML_PATH = "apartment_availability_report.html"
 
@@ -152,15 +174,58 @@ def fetch_rates_for_type(unit_type_id: int, date_from: str, date_to: str) -> tup
         return unit_type_id, None
 
 
-def next_available_from(intervals: list, today: dt.date) -> Optional[dt.date]:
+def add_months(d: dt.date, months: int) -> dt.date:
+    """Adds calendar months to a date, clamping the day to the target month."""
+    month_index = d.month - 1 + months
+    year = d.year + month_index // 12
+    month = month_index % 12 + 1
+    is_leap = (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0))
+    days_in_month = [31, 29 if is_leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    day = min(d.day, days_in_month[month - 1])
+    return dt.date(year, month, day)
+
+
+def classify_availability(intervals: list, today: dt.date) -> Optional[tuple[str, dt.date]]:
+    """
+    Applies the business availability rule to a unit's vacancy intervals.
+
+    Returns (status, available_from) where status is:
+      - "vacant_now"      : vacant today AND stays vacant for the next
+                            VACANT_MONTHS_REQUIRED whole months.
+      - "becoming_vacant" : becomes vacant after today but on/before
+                            HORIZON_DAYS, and then stays vacant for
+                            VACANT_MONTHS_REQUIRED whole months from that date.
+    Returns None if no vacancy qualifies (occupied, too-short a gap, or the
+    next qualifying vacancy starts beyond the horizon).
+
+    The earliest qualifying vacancy wins — so a unit with a too-short gap today
+    but a real 2-month opening next month is correctly reported as
+    "becoming_vacant", not dropped.
+    """
+    horizon = today + dt.timedelta(days=HORIZON_DAYS)
+
     for interval in sorted(intervals, key=lambda x: x["startDate"]):
+        if not interval["available"]:
+            continue
         start = dt.date.fromisoformat(interval["startDate"])
         end = dt.date.fromisoformat(interval["endDate"])
-        if interval["available"]:
-            if start <= today <= end:
-                return today
-            if start >= today:
-                return start
+        if end < today:
+            continue
+
+        effective_start = max(start, today)
+        if effective_start > horizon:
+            continue
+
+        # The whole [effective_start, +N months) span must be vacant. endDate is
+        # the last vacant day, so the last day we need covered is one day before
+        # the N-months-later date.
+        required_last_day = add_months(effective_start, VACANT_MONTHS_REQUIRED) - dt.timedelta(days=1)
+        if end < required_last_day:
+            continue
+
+        status = "vacant_now" if effective_start == today else "becoming_vacant"
+        return status, effective_start
+
     return None
 
 
@@ -205,7 +270,8 @@ def parse_apartment_number(unit_name: str) -> str:
     return match.group(1) if match else unit_name.strip()
 
 
-def build_report_rows() -> list[dict]:
+def build_report_rows() -> tuple[list[dict], list[dict]]:
+    """Returns (vacant_now_rows, becoming_vacant_rows), each already sorted."""
     today = dt.date.today()
     date_from = today.isoformat()
     date_to = (today + dt.timedelta(days=LOOKAHEAD_DAYS)).isoformat()
@@ -238,7 +304,8 @@ def build_report_rows() -> list[dict]:
             if rates is not None:
                 rates_by_type[tid] = rates
 
-    rows = []
+    vacant_now: list[dict] = []
+    becoming_vacant: list[dict] = []
     for u in units:
         uid = u["id"]
         ut = unit_types.get(uid)
@@ -246,9 +313,10 @@ def build_report_rows() -> list[dict]:
         if not ut or not ivals:
             continue
 
-        available_from = next_available_from(ivals, today)
-        if available_from is None:
+        classified = classify_availability(ivals, today)
+        if classified is None:
             continue
+        status, available_from = classified
 
         rate_entries = rates_by_type.get(ut["id"])
         if not rate_entries:
@@ -258,34 +326,31 @@ def build_report_rows() -> list[dict]:
             continue
         _, amount = rate
 
-        rows.append(
-            {
-                "apartment_number": parse_apartment_number(u["unitName"]),
-                "apartment_name": u["buildingName"],
-                "unit_type": ut.get("name") or "",
-                "price_monthly_gbp": amount,
-                "available_from": available_from,
-            }
-        )
+        row = {
+            "apartment_number": parse_apartment_number(u["unitName"]),
+            "apartment_name": u["buildingName"],
+            "unit_type": ut.get("name") or "",
+            "price_monthly_gbp": amount,
+            "available_from": available_from,
+        }
+        (vacant_now if status == "vacant_now" else becoming_vacant).append(row)
 
-    rows.sort(key=lambda r: (r["available_from"], r["apartment_name"], r["apartment_number"]))
-    return rows
+    vacant_now.sort(key=lambda r: (r["apartment_name"], r["apartment_number"]))
+    becoming_vacant.sort(key=lambda r: (r["available_from"], r["apartment_name"], r["apartment_number"]))
+    return vacant_now, becoming_vacant
 
 
-def render_html(rows: list[dict]) -> str:
-    generated_at = dt.datetime.now().strftime("%d %b %Y, %H:%M")
-    today = dt.date.today()
-
-    row_html = []
+def _render_rows(rows: list[dict], show_now_badge: bool) -> str:
+    cells = []
     for r in rows:
-        is_now = r["available_from"] == today
         badge = (
             '<span style="display:inline-block;padding:2px 8px;border-radius:10px;'
             'background:#e6f4ea;color:#1e7e34;font-size:11px;font-weight:700;margin-left:8px;">NOW</span>'
-            if is_now
+            if show_now_badge
             else ""
         )
-        row_html.append(
+        available_label = "Now" if show_now_badge else r["available_from"].strftime("%d %b %Y")
+        cells.append(
             f"""
             <tr>
                 <td style="padding:9px 14px;border-bottom:1px solid #eee;font-weight:600;">{r['apartment_number']}</td>
@@ -294,10 +359,33 @@ def render_html(rows: list[dict]) -> str:
                     <span style="color:#888;font-size:12px;">{r['unit_type']}</span>
                 </td>
                 <td style="padding:9px 14px;border-bottom:1px solid #eee;">£{r['price_monthly_gbp']:,.0f} / month</td>
-                <td style="padding:9px 14px;border-bottom:1px solid #eee;">{r['available_from'].strftime('%d %b %Y')}{badge}</td>
+                <td style="padding:9px 14px;border-bottom:1px solid #eee;">{available_label}{badge}</td>
             </tr>
             """
         )
+    return "".join(cells)
+
+
+def _render_table(rows: list[dict], show_now_badge: bool) -> str:
+    if not rows:
+        return '<p style="color:#888;font-size:14px;margin:8px 0 0;">None.</p>'
+    return f"""<table style="width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.08);margin-top:12px;">
+            <thead>
+                <tr style="background:#111;color:#fff;text-align:left;">
+                    <th style="padding:10px 14px;">Apt #</th>
+                    <th style="padding:10px 14px;">Apartment</th>
+                    <th style="padding:10px 14px;">Current Price</th>
+                    <th style="padding:10px 14px;">Available From</th>
+                </tr>
+            </thead>
+            <tbody>
+                {_render_rows(rows, show_now_badge)}
+            </tbody>
+        </table>"""
+
+
+def render_html(vacant_now: list[dict], becoming_vacant: list[dict]) -> str:
+    generated_at = dt.datetime.now().strftime("%d %b %Y, %H:%M")
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -310,21 +398,17 @@ def render_html(rows: list[dict]) -> str:
         <div style="font-size:26px;font-weight:800;letter-spacing:-0.5px;color:#111;margin-bottom:4px;">GravityCo</div>
         <h1 style="font-size:19px;margin:0 0 4px 0;color:#111;">Live Apartment Availability</h1>
         <p style="color:#666;font-size:13px;margin-top:0;">
-            Generated {generated_at} · {len(rows)} apartments with confirmed availability &amp; pricing
+            Generated {generated_at} · a unit counts as available only if it is vacant
+            for at least {VACANT_MONTHS_REQUIRED} consecutive months · horizon: {HORIZON_DAYS} days
         </p>
-        <table style="width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.08);margin-top:12px;">
-            <thead>
-                <tr style="background:#111;color:#fff;text-align:left;">
-                    <th style="padding:10px 14px;">Apt #</th>
-                    <th style="padding:10px 14px;">Apartment</th>
-                    <th style="padding:10px 14px;">Current Price</th>
-                    <th style="padding:10px 14px;">Available From</th>
-                </tr>
-            </thead>
-            <tbody>
-                {"".join(row_html)}
-            </tbody>
-        </table>
+
+        <h2 style="font-size:16px;margin:22px 0 0;color:#111;">Vacant now <span style="color:#888;font-weight:400;">({len(vacant_now)})</span></h2>
+        <p style="color:#888;font-size:12px;margin:2px 0 0;">Vacant today and for the next {VACANT_MONTHS_REQUIRED} months.</p>
+        {_render_table(vacant_now, show_now_badge=True)}
+
+        <h2 style="font-size:16px;margin:30px 0 0;color:#111;">Becoming vacant within {HORIZON_DAYS} days <span style="color:#888;font-weight:400;">({len(becoming_vacant)})</span></h2>
+        <p style="color:#888;font-size:12px;margin:2px 0 0;">Not vacant today, but open up within the next 3 months and then stay vacant for at least {VACANT_MONTHS_REQUIRED} months.</p>
+        {_render_table(becoming_vacant, show_now_badge=False)}
     </div>
 </body>
 </html>
@@ -332,11 +416,12 @@ def render_html(rows: list[dict]) -> str:
 
 
 def main() -> None:
-    rows = build_report_rows()
-    html = render_html(rows)
+    vacant_now, becoming_vacant = build_report_rows()
+    html = render_html(vacant_now, becoming_vacant)
     with open(OUTPUT_HTML_PATH, "w", encoding="utf-8") as f:
         f.write(html)
-    print(f"Wrote {OUTPUT_HTML_PATH} ({len(rows)} apartments)")
+    print(f"Wrote {OUTPUT_HTML_PATH} "
+          f"(vacant now: {len(vacant_now)}, becoming vacant ≤{HORIZON_DAYS}d: {len(becoming_vacant)})")
 
 
 if __name__ == "__main__":
