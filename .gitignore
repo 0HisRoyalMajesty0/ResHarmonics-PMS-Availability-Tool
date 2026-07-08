@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 availability_report*.html
 apartment_availability_report*.html
+
+# Generated data exports (contain live pricing/availability — don't commit)
+*.xlsx
