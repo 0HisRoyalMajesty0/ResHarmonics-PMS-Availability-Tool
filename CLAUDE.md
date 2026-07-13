@@ -5,6 +5,26 @@ where the initial version of this tool was built without live network access
 to the target API, so several things are verified-in-theory but not
 verified-live.
 
+## "Availability" — the definition to use (set by the user, 2026-07-13)
+
+When the user asks for **"availability"** (or "the availability", "latest
+availability", etc.), it means specifically this — produce it, don't ask:
+
+- A unit counts as **available** only if it is vacant for the next **2 months**
+  (2 consecutive calendar months from when it becomes vacant).
+- **Two lists, in this order:**
+  1. **Vacant now** — units vacant today (and, per the rule above, staying
+     vacant for the next 2 months).
+  2. **Becoming vacant in the next 3 months** — units that open up after today
+     but on/before the horizon, then stay vacant 2 months.
+- **Horizon: 92 days** (= "3 months"). Do NOT report anything becoming vacant
+  beyond 92 days from whenever the automation is run.
+
+This is exactly what `apartment_availability_report.py` implements
+(`classify_availability()`, `VACANT_MONTHS_REQUIRED=2`, `HORIZON_DAYS=92`).
+Default delivery is the branded output to Slack channel `C0B9NFGR0H1`
+(canvas `F0BGT1VMQV6`); an `.xlsx` export is also available on request.
+
 ## Goal
 
 Automate pulling live availability from Res:Harmonics (Gravity Coliving's
