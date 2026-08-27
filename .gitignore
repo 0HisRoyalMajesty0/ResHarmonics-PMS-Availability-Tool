@@ -10,3 +10,4 @@ apartment_availability_report*.html
 # Departing-tenants exports (contain tenant names/emails — never commit)
 departures.json
 departing_tenants_cleaning*.html
+eot_cleaning_chase_list.html
