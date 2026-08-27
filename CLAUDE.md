@@ -128,15 +128,49 @@ and who wants Gravity to do their end-of-tenancy clean?". Used by
   end without an extension conversation is invisible. Always take departures
   from the PMS and use Pipedrive only for the preference lookup.
 
-## Not yet confirmed against the live API
+## Departures / tenancies — confirmed live (2026-08-27)
 
-- The **tenancy/booking endpoint** used by `departing_tenants_cleaning.py` to
-  list departures. The session that wrote that script had no PMS credentials,
-  so rather than guess (the mistake CLAUDE.md already records once), it
-  resolves the endpoint from `GET /v3/api-docs` at runtime and prints its
-  choice. Run `python3 departing_tenants_cleaning.py discover` with real
-  credentials, confirm the right path, then record it here and pin it via
-  `--endpoint` / `RESHARMONICS_DEPARTURES_ENDPOINT`.
+Resolved via `discover` against the real spec, then run end-to-end.
+
+- `GET /api/v3/roomStays?checkOutDateFrom=&checkOutDateTo=&size=500` — the
+  departures query. A *room stay* is one booking of one unit by one contact:
+  `{roomStayId, roomStayStatus, startDate, endDate, bookingContact:{firstName,
+  lastName, emailAddress, id}, unit:{id, name, buildingName}}`. `unit.name`
+  ("98 West Court") matches the Pipedrive unit label format exactly.
+  Statuses seen live: `CHECKED_IN`, `CONFIRMED`, `CANCELLED`.
+- `GET /api/v3/roomStays?bookingContactId=` — one contact's whole history.
+- `GET /api/v3/guestStays?…&emailAddress=&firstName=&lastName=` also exists if
+  per-guest (rather than per-booking-contact) detail is ever needed.
+- Do NOT use `GET /api/v3/bookings` for this: its `dateFrom`/`dateTo` are stay
+  overlap, not checkout, so it can't answer "who leaves in this window".
+
+**A renewal is a NEW room stay, not an extended end date.** So "room stays
+ending in the next 30 days" is NOT the departure list — on 2026-08-27 it
+returned 54 stays of which 15 were renewals (tenants staying put). A contact is
+only leaving if the LAST of their stays ends inside the window; back-to-back
+stays must be stitched into one tenancy to get a true tenancy length. This is
+implemented in `build_departures()` / `contiguous_tenancy_start()` and is the
+single most important rule in that script — getting it wrong sends cleaners to
+occupied flats.
+
+**Never match a PMS tenant to a Pipedrive deal by unit.** Units are re-let, so
+a unit-only match reliably finds the *previous* occupant's deal — live data had
+"46 West Court" resolving to a moved-out tenant whose cleaning preference would
+then have been attributed to the current one. Match on person (name/email); use
+the unit only to disambiguate one person's several deals.
+
+Live shape of the answer on 2026-08-27 (30-day window): 39 genuine departures =
+26 residential tenants + 13 short-stay guests. Only 13 of the 26 had any deal in
+pipelines 5/7 at all, and exactly ONE had a recorded cleaning preference.
+
+## Network note
+
+`api.pipedrive.com` is blocked by the Claude Code sandbox egress policy (403 on
+CONNECT), so `departing_tenants_cleaning.py`'s direct REST path can't run there
+— it degrades to writing the departure list and tells you to use the Pipedrive
+MCP tools for the CRM half. The PMS hosts (`auth.rerumapp.uk`,
+`apiv3.rerumapp.uk`) are reachable. Outside the sandbox, with
+`PIPEDRIVE_API_TOKEN` set, the script runs end to end unaided.
 
 ## Design decisions worth knowing about (don't relitigate without reason)
 

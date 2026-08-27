@@ -57,11 +57,14 @@ python3 departing_tenants_cleaning.py discover          # confirm the PMS endpoi
 python3 departing_tenants_cleaning.py report --days 30  # writes HTML + JSON
 ```
 
-Run `discover` first on a fresh credential set. The tenancy endpoint is the one
-part of the PMS API this repo has **not** confirmed live, so the script resolves
-it from the OpenAPI spec at runtime and prints its choice rather than shipping a
-hard-coded guess. Pin it with `--endpoint` (or `RESHARMONICS_DEPARTURES_ENDPOINT`)
-once you know the real path, and record it in `CLAUDE.md`.
+Endpoints are confirmed live (`/api/v3/roomStays`); `discover` re-checks the
+OpenAPI spec if the API ever changes.
+
+Two rules in here matter more than the rest, both learned from live data:
+a **renewal is a new room stay**, so "stays ending soon" is not the departure
+list (15 of 54 were renewals on the first real run), and **units are re-let**,
+so a tenant is never matched to a CRM deal by unit — that finds the previous
+occupant. See `CLAUDE.md`.
 
 `PIPEDRIVE_API_TOKEN` is optional — without it you still get the departure list,
 written to `departures.json`, and the CRM half can be done via the Pipedrive MCP.

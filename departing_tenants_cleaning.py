@@ -19,27 +19,43 @@ Two data sources, each authoritative for a different half:
                           deals (see CLEANING_* patterns below).
 
 ------------------------------------------------------------------------------
-ENDPOINT DISCOVERY — read this before debugging a 404
+CONFIRMED ENDPOINTS (live, 2026-08-27)
 ------------------------------------------------------------------------------
-The units/availability/rates endpoints used elsewhere in this repo were
-confirmed live (see CLAUDE.md). The *tenancy/booking* endpoint needed here was
-NOT — the session that wrote this file had no PMS credentials, and CLAUDE.md
-records that blind-guessing endpoint names has burned this project before.
+  GET /api/v3/roomStays?checkOutDateFrom=&checkOutDateTo=&size=500
+      -> {"content": [{roomStayId, roomStayStatus, startDate, endDate,
+                       bookingContact: {firstName, lastName, emailAddress, id},
+                       unit: {id, name, buildingName}, ...}], "page": {...}}
+      A room stay is one booking of one unit by one contact. `unit.name` is
+      formatted exactly like the Pipedrive unit field ("98 West Court"), which
+      makes it a reliable join key between the two systems.
+      Statuses seen in practice: CHECKED_IN (in residence), CONFIRMED (booked,
+      not yet arrived), CANCELLED (ignored).
 
-So this script does not hard-code a guess. It resolves the endpoint at runtime
-from the live OpenAPI spec at GET /v3/api-docs, and prints what it picked so the
-choice is auditable. Two escape hatches:
+  GET /api/v3/roomStays?bookingContactId=&size=200
+      -> every stay belonging to one contact. Used for renewal detection.
 
+`discover` remains available for re-checking the spec if the API changes:
     python departing_tenants_cleaning.py discover
-        Dumps every GET path in the spec that looks tenancy/booking/client
-        related, with its parameters. Run this first on a fresh credential set.
 
-    python departing_tenants_cleaning.py report --endpoint /api/v3/bookings
-        Pins the endpoint explicitly (or set RESHARMONICS_DEPARTURES_ENDPOINT),
-        bypassing auto-resolution entirely.
+------------------------------------------------------------------------------
+WHY THIS ISN'T JUST "ROOM STAYS ENDING SOON"
+------------------------------------------------------------------------------
+A tenant who renews gets a *new* room stay starting the day the old one ends,
+rather than an extended end date on the existing one. So the naive query — room
+stays with a checkout date in the window — reports renewing tenants as
+departures. On the 2026-08-27 run, 15 of 54 matching room stays were renewals;
+reporting them would have sent cleaners to 15 occupied flats.
 
-Record the confirmed path in CLAUDE.md once you've seen it work, the same way
-the availability endpoints were recorded.
+So a contact is only leaving if the LAST of their stays ends inside the window.
+Back-to-back bookings are stitched into one tenancy (see contiguous_tenancy_start)
+so the reported tenancy length is the real one, not just the final segment.
+
+Departures are split into residential tenants and short-stay guests by
+TENANCY_MIN_NIGHTS. End-of-tenancy cleaning is a residential concept — a 2-night
+stay gets ordinary turnover cleaning and never appears in the CRM — so mixing
+them would inflate the "nothing recorded" bucket with rows that will never have
+a record. Both groups are reported; only tenants are cross-checked against
+Pipedrive.
 
 ------------------------------------------------------------------------------
 CREDENTIALS (all via environment, never hard-coded)
@@ -63,7 +79,8 @@ import os
 import re
 import sys
 import time
-from typing import Any, Iterable, Optional
+from concurrent.futures import ThreadPoolExecutor
+from typing import Iterable, Optional
 
 import requests
 
@@ -76,6 +93,20 @@ PIPEDRIVE_BASE_URL = "https://api.pipedrive.com"
 PIPEDRIVE_API_TOKEN = os.environ.get("PIPEDRIVE_API_TOKEN")
 
 DEFAULT_DAYS = 30
+
+# Confirmed live 2026-08-27. Overridable if the API changes — run `discover`.
+DEPARTURES_ENDPOINT = os.environ.get("RESHARMONICS_DEPARTURES_ENDPOINT", "/api/v3/roomStays")
+
+# A room stay in this state isn't a real occupancy and must never be treated as
+# a departure or as evidence of a renewal.
+IGNORED_STAY_STATUSES = {"CANCELLED", "NO_SHOW"}
+
+# Below this, a stay is a short-let guest rather than a residential tenant.
+# The live data has a clean gap here: stays cluster at <=14 nights (short-lets,
+# mostly The Weymouth and OTA bookings) or >=31 nights (monthly tenancies).
+TENANCY_MIN_NIGHTS = 28
+
+MAX_WORKERS = 8
 
 # Pipedrive pipelines that carry move-out conversations. Confirmed live
 # 2026-08-27 via the Pipedrive MCP: pipeline 5 is "Extensions" (deals titled
@@ -278,205 +309,100 @@ def discover(args: argparse.Namespace) -> int:
     return 0
 
 
-def resolve_departures_endpoint(spec: dict) -> tuple[str, dict]:
-    """
-    Pick the GET endpoint that lists tenancies over a date range.
-
-    Prefers an operation that both reads as tenancy/booking-shaped AND accepts
-    date-range parameters, since that's what we need to filter departures. The
-    choice is printed so a wrong guess is obvious rather than silent.
-    """
-    override = os.environ.get("RESHARMONICS_DEPARTURES_ENDPOINT")
-    if override:
-        operation = (spec.get("paths") or {}).get(override, {}).get("get") or {}
-        return override, operation
-
-    best: Optional[tuple[int, str, dict]] = None
-    for path, operation in _spec_get_operations(spec):
-        haystack = f"{path} {operation.get('summary', '')} {operation.get('operationId', '')}".lower()
-        score = sum(weight for word, weight in _DEPARTURE_KEYWORDS.items() if word in haystack)
-        if not score:
-            continue
-        # Path parameters mean "one specific record", not a listing.
-        if "{" in path:
-            continue
-        params = [p.lower() for p in _param_names(operation)]
-        if any("date" in p or "from" in p or "to" in p for p in params):
-            score += 10
-        if any(p in ("size", "page", "limit") for p in params):
-            score += 2
-        if best is None or score > best[0]:
-            best = (score, path, operation)
-
-    if best is None:
-        raise RuntimeError(
-            "Could not resolve a departures endpoint from the OpenAPI spec.\n"
-            "Run `python departing_tenants_cleaning.py discover` and pass the right "
-            "path via --endpoint or RESHARMONICS_DEPARTURES_ENDPOINT."
-        )
-    return best[1], best[2]
-
-
-def _pick_param(candidates: list[str], *wanted: str) -> Optional[str]:
-    """Find the actual spelling of a parameter (dateFrom vs date_from vs from)."""
-    lowered = {c.lower(): c for c in candidates}
-    for want in wanted:
-        if want.lower() in lowered:
-            return lowered[want.lower()]
-    for want in wanted:
-        for low, original in lowered.items():
-            if want.lower() in low:
-                return original
-    return None
-
-
-# --- Tolerant field extraction ----------------------------------------------
-#
-# The tenancy record's schema is unconfirmed, so rather than assuming key names
-# we search each record for the shapes we need. Every extracted value is echoed
-# in the JSON output so a mis-pick is visible.
-
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-
-
-def _walk(value: Any, prefix: str = "") -> Iterable[tuple[str, Any]]:
-    if isinstance(value, dict):
-        for key, sub in value.items():
-            yield from _walk(sub, f"{prefix}.{key}" if prefix else key)
-    elif isinstance(value, list):
-        for index, sub in enumerate(value):
-            yield from _walk(sub, f"{prefix}[{index}]")
-    else:
-        yield prefix, value
-
-
-def extract_email(record: dict) -> Optional[str]:
-    for path, value in _walk(record):
-        if isinstance(value, str) and _EMAIL_RE.match(value.strip()):
-            # Prefer a field that actually calls itself an email.
-            if "email" in path.lower():
-                return value.strip()
-    for _, value in _walk(record):
-        if isinstance(value, str) and _EMAIL_RE.match(value.strip()):
-            return value.strip()
-    return None
-
-
-def extract_name(record: dict) -> Optional[str]:
-    first = last = full = None
-    for path, value in _walk(record):
-        if not isinstance(value, str) or not value.strip():
-            continue
-        low = path.lower()
-        if "email" in low:
-            continue
-        if full is None and re.search(r"(^|\.)(fullname|full_name|name|displayname)$", low):
-            full = value.strip()
-        elif first is None and re.search(r"(firstname|first_name|forename|givenname)$", low):
-            first = value.strip()
-        elif last is None and re.search(r"(lastname|last_name|surname|familyname)$", low):
-            last = value.strip()
-    if first or last:
-        return " ".join(p for p in (first, last) if p)
-    return full
-
-
-def extract_date(record: dict, *wanted: str) -> Optional[dt.date]:
-    for path, value in _walk(record):
-        low = path.lower()
-        if not any(w.lower() in low for w in wanted):
-            continue
-        if isinstance(value, str) and len(value) >= 10:
-            try:
-                return dt.date.fromisoformat(value[:10])
-            except ValueError:
-                continue
-    return None
-
-
-def extract_unit(record: dict) -> Optional[str]:
-    for path, value in _walk(record):
-        low = path.lower()
-        if isinstance(value, str) and value.strip() and re.search(r"unit.*name|unitname|room|apartment", low):
-            return value.strip()
-    return None
-
-
-def extract_building(record: dict) -> Optional[str]:
-    for path, value in _walk(record):
-        low = path.lower()
-        if isinstance(value, str) and value.strip() and "building" in low:
-            return value.strip()
-    return None
-
-
 # --- Departure fetch ---------------------------------------------------------
 
-def fetch_departures(days: int, endpoint_override: Optional[str] = None) -> list[dict]:
-    """Tenancies whose end date falls within the next `days` days."""
-    spec = fetch_openapi_spec()
-    if endpoint_override:
-        path = endpoint_override
-        operation = (spec.get("paths") or {}).get(path, {}).get("get") or {}
-    else:
-        path, operation = resolve_departures_endpoint(spec)
-
-    params_available = _param_names(operation)
-    print(f"[info] using departures endpoint: GET {path}", file=sys.stderr)
-    if params_available:
-        print(f"[info] endpoint params: {', '.join(params_available)}", file=sys.stderr)
-
-    today = dt.date.today()
-    horizon = today + dt.timedelta(days=days)
-
-    query: dict[str, Any] = {}
-    from_param = _pick_param(params_available, "dateFrom", "startDate", "from")
-    to_param = _pick_param(params_available, "dateTo", "endDate", "to")
-    size_param = _pick_param(params_available, "size", "limit", "pageSize")
-    if from_param:
-        query[from_param] = today.isoformat()
-    if to_param:
-        query[to_param] = horizon.isoformat()
-    if size_param:
-        query[size_param] = 500
-
-    resp = requests.get(f"{API_BASE_URL}{path}", params=query, headers=_headers(), timeout=45)
+def _fetch_room_stays(params: dict) -> list[dict]:
+    query = {"size": 500, **params}
+    resp = requests.get(
+        f"{API_BASE_URL}{DEPARTURES_ENDPOINT}", params=query, headers=_headers(), timeout=60
+    )
     resp.raise_for_status()
     payload = resp.json()
-
-    records = payload.get("content") if isinstance(payload, dict) else payload
-    if records is None and isinstance(payload, dict):
-        # Some endpoints wrap the list under a different key.
-        for value in payload.values():
-            if isinstance(value, list):
-                records = value
-                break
-    if not isinstance(records, list):
+    stays = payload.get("content")
+    if stays is None:
         raise RuntimeError(
-            f"GET {path} did not return a list of records (got keys: "
-            f"{list(payload) if isinstance(payload, dict) else type(payload).__name__}).\n"
-            "Run `discover` and pin the correct endpoint with --endpoint."
+            f"GET {DEPARTURES_ENDPOINT} returned no 'content' key (got {list(payload)}). "
+            "Run `discover` — the API shape may have changed."
         )
+    return [s for s in stays if s.get("roomStayStatus") not in IGNORED_STAY_STATUSES]
 
-    print(f"[info] {len(records)} records returned; filtering to departures", file=sys.stderr)
 
+def _fetch_stays_for_contact(contact_id: int) -> tuple[int, list[dict]]:
+    try:
+        return contact_id, _fetch_room_stays({"bookingContactId": contact_id, "size": 200})
+    except requests.RequestException as exc:
+        print(f"[warn] stay lookup failed for contact {contact_id}: {exc}", file=sys.stderr)
+        return contact_id, []
+
+
+def contiguous_tenancy_start(stays: list[dict], end_date: dt.date) -> dt.date:
+    """
+    Walk backwards through back-to-back bookings to find when the tenancy began.
+
+    A tenant who renews annually has several room stays chained end-to-start
+    (…2025-08-31, 2025-08-31…2026-08-31, …). Measuring only the final stay would
+    call a four-year resident a one-year one, so consecutive stays are stitched
+    into a single tenancy.
+    """
+    start = end_date
+    changed = True
+    while changed:
+        changed = False
+        for stay in stays:
+            stay_start = dt.date.fromisoformat(stay["startDate"])
+            stay_end = dt.date.fromisoformat(stay["endDate"])
+            if stay_start < start <= stay_end:
+                start = stay_start
+                changed = True
+    return start
+
+
+def build_departures(
+    stays_by_contact: dict[int, list[dict]],
+    contacts: dict[int, dict],
+    today: dt.date,
+    horizon: dt.date,
+) -> list[dict]:
+    """
+    Reduce every contact's stay history to at most one departure.
+
+    A contact is leaving only if the LAST of their stays ends within the window.
+    Anyone with a stay ending in the window but a later stay after it has renewed
+    and is staying put — see the module docstring. Kept pure (no I/O) so the rule
+    that decides whether a cleaner gets booked is directly testable.
+    """
     departures = []
-    for record in records:
-        if not isinstance(record, dict):
+    for contact_id, stays in stays_by_contact.items():
+        if not stays:
             continue
-        end_date = extract_date(record, "enddate", "departure", "checkout", "moveout", "to")
-        if end_date is None or not (today <= end_date <= horizon):
+        final_end = max(dt.date.fromisoformat(s["endDate"]) for s in stays)
+        if not (today <= final_end <= horizon):
             continue
-        building = extract_building(record)
-        if building in EXCLUDED_BUILDINGS:
+
+        last_stay = next(s for s in stays if dt.date.fromisoformat(s["endDate"]) == final_end)
+        unit = last_stay.get("unit") or {}
+        if unit.get("buildingName") in EXCLUDED_BUILDINGS:
             continue
+
+        contact = contacts.get(contact_id) or last_stay.get("bookingContact") or {}
+        name = " ".join(
+            part for part in (contact.get("firstName"), contact.get("lastName")) if part
+        ).strip()
+        tenancy_start = contiguous_tenancy_start(stays, final_end)
+        nights = (final_end - tenancy_start).days
+
         departures.append(
             {
-                "name": extract_name(record) or "(name not found in record)",
-                "email": extract_email(record),
-                "unit": extract_unit(record),
-                "building": building,
-                "end_date": end_date.isoformat(),
+                "name": name or f"(contact {contact_id})",
+                "email": contact.get("emailAddress"),
+                "contact_id": contact_id,
+                "unit": unit.get("name"),
+                "building": unit.get("buildingName"),
+                "end_date": final_end.isoformat(),
+                "tenancy_start": tenancy_start.isoformat(),
+                "nights": nights,
+                "is_tenant": nights >= TENANCY_MIN_NIGHTS,
+                "status": last_stay.get("roomStayStatus"),
             }
         )
 
@@ -484,6 +410,37 @@ def fetch_departures(days: int, endpoint_override: Optional[str] = None) -> list
     return departures
 
 
+def fetch_departures(days: int) -> list[dict]:
+    """Everyone whose stay genuinely ends within the next `days` days."""
+    today = dt.date.today()
+    horizon = today + dt.timedelta(days=days)
+
+    window_stays = _fetch_room_stays(
+        {"checkOutDateFrom": today.isoformat(), "checkOutDateTo": horizon.isoformat()}
+    )
+    print(f"[info] {len(window_stays)} room stays end within {days} days", file=sys.stderr)
+
+    contacts: dict[int, dict] = {}
+    for stay in window_stays:
+        contact = stay.get("bookingContact") or {}
+        if contact.get("id") is not None:
+            contacts[contact["id"]] = contact
+
+    # Each contact's full history, so a renewal booked after the window is still
+    # seen. Without this pass, renewing tenants read as departures.
+    stays_by_contact: dict[int, list[dict]] = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        for contact_id, stays in executor.map(_fetch_stays_for_contact, contacts):
+            stays_by_contact[contact_id] = stays
+
+    departures = build_departures(stays_by_contact, contacts, today, horizon)
+    renewals = len(contacts) - len(departures)
+    print(
+        f"[info] {len(departures)} genuine departures "
+        f"({renewals} contact(s) excluded as renewals or later departures)",
+        file=sys.stderr,
+    )
+    return departures
 # --- Pipedrive ---------------------------------------------------------------
 
 def _pipedrive_get(path: str, params: dict) -> dict:
@@ -598,14 +555,12 @@ def match_departures_to_pipedrive(departures: list[dict]) -> list[dict]:
     deals = fetch_pipedrive_move_out_deals()
     print(f"[info] {len(deals)} Pipedrive move-out deals fetched", file=sys.stderr)
 
-    by_unit: dict[str, list[dict]] = {}
     by_name: dict[str, list[dict]] = {}
     for deal in deals:
         custom = deal.get("custom_fields") or {}
         unit_field = custom.get(PD_FIELD_UNIT)
         unit_label = unit_field.get("label") if isinstance(unit_field, dict) else unit_field
-        if unit_label:
-            by_unit.setdefault(_normalise_unit(unit_label), []).append(deal)
+        deal["_unit_key"] = _normalise_unit(unit_label) if unit_label else None
         # Deal titles lead with the tenant's name: "Dylan Moulder - WC 81 - ET".
         title_name = (deal.get("title") or "").split(" - ")[0]
         if title_name:
@@ -613,15 +568,22 @@ def match_departures_to_pipedrive(departures: list[dict]) -> list[dict]:
 
     results = []
     for departure in departures:
-        candidates = by_unit.get(_normalise_unit(departure.get("unit")), [])
-        matched_on = "unit"
-        if not candidates:
-            candidates = by_name.get(_normalise_name(departure.get("name")), [])
-            matched_on = "name"
+        # Identity must come from the PERSON, never the unit. Units are re-let,
+        # so a unit-only match reliably finds the PREVIOUS occupant's deal — on
+        # the 2026-08-27 data, matching "46 West Court" returned the deal of a
+        # tenant who had already moved out, whose cleaning preference would then
+        # have been attributed to the current one. Unit is corroboration only.
+        candidates = by_name.get(_normalise_name(departure.get("name")), [])
+        matched_on = "name"
         if not candidates:
             results.append({**departure, "deal": None, "matched_on": None,
                             "preference": PREF_NONE, "evidence": None})
             continue
+
+        unit_key = _normalise_unit(departure.get("unit"))
+        same_unit = [d for d in candidates if unit_key and d.get("_unit_key") == unit_key]
+        if same_unit:
+            candidates, matched_on = same_unit, "name+unit"
 
         # Most recently updated deal is the live conversation.
         deal = max(candidates, key=lambda d: d.get("update_time") or "")
@@ -681,9 +643,28 @@ def print_console_report(rows: list[dict], days: int) -> None:
     print()
 
 
-def render_html(rows: list[dict], days: int) -> str:
+def _render_short_stays(short_stays: list[dict]) -> str:
+    """Short-let checkouts, listed for completeness — no EOT cleaning applies."""
+    if not short_stays:
+        return ""
+    items = "".join(
+        f'<li style="margin:2px 0;">{s["end_date"]} — {s["name"]} · '
+        f'{s.get("unit") or "?"} · {s["nights"]} night{"s" if s["nights"] != 1 else ""}</li>'
+        for s in short_stays
+    )
+    return f"""
+    <div style="padding:16px 26px;border-top:1px solid #eee;font-size:12px;color:#666;">
+      <strong style="color:#444;">Short-stay guests also checking out ({len(short_stays)})</strong>
+      <p style="margin:4px 0 8px;color:#999;">Turnover cleans, not end-of-tenancy — these
+         never appear in the CRM.</p>
+      <ul style="margin:0;padding-left:18px;">{items}</ul>
+    </div>"""
+
+
+def render_html(rows: list[dict], days: int, short_stays: Optional[list[dict]] = None) -> str:
     counts = summarise(rows)
     today = dt.date.today()
+    short_stays = short_stays or []
 
     body_rows = []
     for row in rows:
@@ -738,8 +719,11 @@ def render_html(rows: list[dict], days: int) -> str:
       </tr></thead>
       <tbody>{''.join(body_rows)}</tbody>
     </table>
+    {_render_short_stays(short_stays)}
     <div style="padding:14px 26px;color:#999;font-size:11px;border-top:1px solid #eee;">
       Departures from Res:Harmonics · cleaning preference parsed from Pipedrive deal notes.
+      Renewing tenants are excluded: a renewal is a new room stay, so anyone whose
+      final stay ends after this window is still in residence.
       Quoted text is the note the classification came from — verify anything marked
       “Asked, no answer yet” before booking cleaners.
     </div>
@@ -750,31 +734,53 @@ def render_html(rows: list[dict], days: int) -> str:
 # --- Entry points ------------------------------------------------------------
 
 def report(args: argparse.Namespace) -> int:
-    departures = fetch_departures(args.days, args.endpoint)
-    print(f"[info] {len(departures)} tenants leaving within {args.days} days", file=sys.stderr)
+    departures = fetch_departures(args.days)
+    tenants = [d for d in departures if d["is_tenant"]]
+    short_stays = [d for d in departures if not d["is_tenant"]]
+    print(
+        f"[info] {len(tenants)} residential tenants and {len(short_stays)} short-stay "
+        f"guests leaving within {args.days} days",
+        file=sys.stderr,
+    )
 
-    if not PIPEDRIVE_API_TOKEN:
+    def without_crm(reason: str) -> int:
         with open(OUTPUT_JSON_PATH, "w") as handle:
-            json.dump(departures, handle, indent=2)
+            json.dump({"tenants": tenants, "short_stays": short_stays}, handle, indent=2)
         print(
-            f"\n[warn] PIPEDRIVE_API_TOKEN not set — wrote the departure list to "
-            f"{OUTPUT_JSON_PATH} without cleaning preferences.\n"
-            "       Set the token, or do the CRM half via the Pipedrive MCP tools.",
+            f"\n[warn] {reason}\n"
+            f"       Wrote the departure list to {OUTPUT_JSON_PATH} without cleaning\n"
+            "       preferences. Do the CRM half via the Pipedrive MCP tools instead.",
             file=sys.stderr,
         )
-        for departure in departures:
+        for departure in tenants:
             print(f"  {departure['end_date']}  {departure['name']:<32} "
                   f"{departure.get('unit') or '?':<20} {departure.get('email') or '(no email)'}")
         return 0
 
-    rows = match_departures_to_pipedrive(departures)
+    if not PIPEDRIVE_API_TOKEN:
+        return without_crm("PIPEDRIVE_API_TOKEN not set.")
+
+    # Only tenants get the CRM lookup — a short-let guest has no EOT conversation.
+    try:
+        rows = match_departures_to_pipedrive(tenants)
+    except requests.exceptions.ProxyError as exc:
+        # Some networks (including Claude Code's sandbox) allow the PMS host but
+        # deny api.pipedrive.com by egress policy. That's a policy decision, not
+        # a bug — degrade to the departure list rather than losing the whole run.
+        return without_crm(f"Pipedrive is unreachable from this network: {exc}")
     print_console_report(rows, args.days)
+    if short_stays:
+        print(f"Short-stay guests also checking out (no EOT cleaning applies): {len(short_stays)}")
+        for stay in short_stays:
+            print(f"  {stay['end_date']}  {stay['name']:<32} {stay.get('unit') or '?':<20} "
+                  f"{stay['nights']}n")
+        print()
 
     with open(OUTPUT_JSON_PATH, "w") as handle:
-        json.dump(rows, handle, indent=2)
+        json.dump({"tenants": rows, "short_stays": short_stays}, handle, indent=2)
     html_path = args.html or OUTPUT_HTML_PATH
     with open(html_path, "w") as handle:
-        handle.write(render_html(rows, args.days))
+        handle.write(render_html(rows, args.days, short_stays))
     print(f"[info] wrote {html_path} and {OUTPUT_JSON_PATH}", file=sys.stderr)
     return 0
 
@@ -791,8 +797,6 @@ def main() -> int:
     report_parser = subparsers.add_parser("report", help="build the departing-tenants report")
     report_parser.add_argument("--days", type=int, default=DEFAULT_DAYS,
                                help=f"departure horizon in days (default {DEFAULT_DAYS})")
-    report_parser.add_argument("--endpoint", default=None,
-                               help="pin the PMS departures endpoint instead of auto-resolving")
     report_parser.add_argument("--html", default=None, help=f"HTML output path (default {OUTPUT_HTML_PATH})")
     report_parser.set_defaults(func=report)
 
