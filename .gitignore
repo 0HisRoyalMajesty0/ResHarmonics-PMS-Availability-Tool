@@ -6,3 +6,7 @@ apartment_availability_report*.html
 
 # Generated data exports (contain live pricing/availability — don't commit)
 *.xlsx
+
+# Departing-tenants exports (contain tenant names/emails — never commit)
+departures.json
+departing_tenants_cleaning*.html

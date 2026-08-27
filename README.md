@@ -46,6 +46,38 @@ python3 apartment_availability_report.py
 Takes about a minute — it walks every bookable unit's vacancy calendar and
 every unit type's rate calendar.
 
+## Departing tenants + cleaning preference (`departing_tenants_cleaning.py`)
+
+Answers "who is leaving in the next N days, and which of them want Gravity to
+handle the end-of-tenancy clean?" — joining Res:Harmonics (who's leaving, with
+names and emails) to Pipedrive (what they've told us about cleaning).
+
+```bash
+python3 departing_tenants_cleaning.py discover          # confirm the PMS endpoint
+python3 departing_tenants_cleaning.py report --days 30  # writes HTML + JSON
+```
+
+Run `discover` first on a fresh credential set. The tenancy endpoint is the one
+part of the PMS API this repo has **not** confirmed live, so the script resolves
+it from the OpenAPI spec at runtime and prints its choice rather than shipping a
+hard-coded guess. Pin it with `--endpoint` (or `RESHARMONICS_DEPARTURES_ENDPOINT`)
+once you know the real path, and record it in `CLAUDE.md`.
+
+`PIPEDRIVE_API_TOKEN` is optional — without it you still get the departure list,
+written to `departures.json`, and the CRM half can be done via the Pipedrive MCP.
+
+Cleaning preference is classified into four buckets: **Gravity arranges**,
+**Tenant does it**, **Asked, no answer yet**, and **Not recorded**. The third
+bucket matters — plenty of notes mention cleaning while recording no tenant
+decision at all ("to check if he wants gravity to arrange his end of tenancy
+cleaning"), and counting those as answers would under-book cleaners. Every
+classification carries the sentence it came from so it can be checked against
+the CRM.
+
+```bash
+python3 -m unittest test_departing_tenants_cleaning -v   # no credentials needed
+```
+
 ## Status — what's confirmed vs. what's still open
 
 **Confirmed (including a live run against the real API on 2026-07-08):**

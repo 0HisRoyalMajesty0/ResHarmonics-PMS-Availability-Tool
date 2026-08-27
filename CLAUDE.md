@@ -93,6 +93,51 @@ working:
   plus a `Gravity Test` sandbox building with 1 demo unit — filter that out).
   All pricing is GBP.
 
+## Confirmed against the live Pipedrive account (2026-08-27)
+
+Explored via the Pipedrive MCP tools while answering "who's leaving in 30 days
+and who wants Gravity to do their end-of-tenancy clean?". Used by
+`departing_tenants_cleaning.py`.
+
+- **Move-out conversations live in two pipelines**: id **5 = Extensions**
+  (deals titled `"<Name> - <UNIT> (Ext.N)"`; `won` = tenant extended and is
+  staying, `lost` = not extending) and id **7 = Early Termination** (titled
+  `"<Name> - <UNIT> - ET"`; stages Formal Notice / Objection Handling /
+  Termination Admin / Upfront Payment Refund).
+- **Deal custom-field keys** (confirmed by cross-checking known deals):
+  - `39a24443c32c1043f92a3a5641e016ba58bed353` — contract end / move-out date
+  - `5ca4575f1ce5eac39e8c8a7f57db84f00fd8bc17` — unit, e.g. `"81 West Court"`
+  - `f061944b5e04511943e57749e83376ccb6ebbb92` — building, e.g. `"West Court - Hounslow"`
+  The unit label shares its format with the PMS's `unitName`, so it's a
+  reliable join key between the two systems (normalise leading zeros: the CRM
+  writes `"004 Royal Heights"`).
+- **There is no structured field for cleaning preference.** It's free text in
+  deal notes, written inconsistently by whoever handled the conversation
+  ("EOT cleaning NOT requested. Tenant will take care of it.", "He opted for
+  end of tenancy cleaning.", "she is happy to pay for the end-of-tenancy
+  cleaning"). If this question keeps coming up, adding a single-option custom
+  field to the Extensions/ET pipelines would remove the need to parse notes at
+  all — worth raising with whoever owns the CRM.
+- **Careful with note text that mentions cleaning but records no decision** —
+  internal to-dos and unanswered questions ("to check if he wants gravity to
+  arrange his end of tenancy cleaning") read as positive to a naive keyword
+  match. The classifier buckets these separately as "asked, no answer yet";
+  don't collapse that bucket into a yes/no, it under-books cleaners.
+- **Pipedrive is NOT a valid source for the departure list.** It only contains
+  tenants someone opened a deal for — anyone reaching their natural contract
+  end without an extension conversation is invisible. Always take departures
+  from the PMS and use Pipedrive only for the preference lookup.
+
+## Not yet confirmed against the live API
+
+- The **tenancy/booking endpoint** used by `departing_tenants_cleaning.py` to
+  list departures. The session that wrote that script had no PMS credentials,
+  so rather than guess (the mistake CLAUDE.md already records once), it
+  resolves the endpoint from `GET /v3/api-docs` at runtime and prints its
+  choice. Run `python3 departing_tenants_cleaning.py discover` with real
+  credentials, confirm the right path, then record it here and pin it via
+  `--endpoint` / `RESHARMONICS_DEPARTURES_ENDPOINT`.
+
 ## Design decisions worth knowing about (don't relitigate without reason)
 
 - **Four-state classification** (Available / Partially Available /
